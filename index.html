@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>JSON / Dict Visual Editor</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -306,8 +308,13 @@
     (function () {
       'use strict';
 
+      // Configure PDF.js worker if loaded
+      if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+
       // =========================================================================
-      // 1. UTF-8 <-> BASE64 UTILITIES
+      // 1. UTF-8, BINARY, CSV, EXCEL & PDF <-> BASE64 UTILITIES
       // =========================================================================
       function utf8ToBase64(str) {
         try {
@@ -322,14 +329,193 @@
         }
       }
 
-      function base64ToUtf8(b64) {
-        const clean = b64.replace(/[\r\n\s]/g, '');
+      function base64ToBytes(b64) {
+        let clean = String(b64).replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+        while (clean.length % 4 !== 0) clean += '=';
         const binary = atob(clean);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
           bytes[i] = binary.charCodeAt(i);
         }
-        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        return bytes;
+      }
+
+      function bytesToBase64(bytes) {
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+      }
+
+      function base64ToUtf8(b64, allowLatin1Fallback) {
+        const bytes = base64ToBytes(b64);
+        try {
+          return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch (e) {
+          if (allowLatin1Fallback) {
+            return new TextDecoder('iso-8859-1').decode(bytes);
+          }
+          throw e;
+        }
+      }
+
+      // CSV Parser & Serializer (handles quoted fields, commas, newlines)
+      function parseCsvToGrid(csvText, delimiter) {
+        const sep = delimiter || detectCsvDelimiter(csvText);
+        const rows = [];
+        let row = [];
+        let field = '';
+        let inQuotes = false;
+        const s = String(csvText).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        for (let i = 0; i < s.length; i++) {
+          const c = s[i];
+          if (inQuotes) {
+            if (c === '"') {
+              if (s[i + 1] === '"') {
+                field += '"';
+                i++;
+              } else {
+                inQuotes = false;
+              }
+            } else {
+              field += c;
+            }
+          } else {
+            if (c === '"') {
+              inQuotes = true;
+            } else if (c === sep) {
+              row.push(field);
+              field = '';
+            } else if (c === '\n') {
+              row.push(field);
+              rows.push(row);
+              row = [];
+              field = '';
+            } else {
+              field += c;
+            }
+          }
+        }
+        if (field.length > 0 || row.length > 0) {
+          row.push(field);
+          rows.push(row);
+        }
+        // Normalize column count
+        const maxCols = rows.reduce((m, r) => Math.max(m, r.length), 0) || 1;
+        return rows.map(r => {
+          while (r.length < maxCols) r.push('');
+          return r;
+        });
+      }
+
+      function serializeGridToCsv(grid, delimiter) {
+        const sep = delimiter || ',';
+        return grid.map(row =>
+          row.map(cell => {
+            const s = String(cell == null ? '' : cell);
+            if (s.includes(sep) || s.includes('"') || s.includes('\n')) {
+              return '"' + s.replace(/"/g, '""') + '"';
+            }
+            return s;
+          }).join(sep)
+        ).join('\n');
+      }
+
+      function detectCsvDelimiter(text) {
+        const firstLines = String(text).split(/\r?\n/).filter(l => l.trim().length > 0).slice(0, 5);
+        if (firstLines.length === 0) return ',';
+        const candidates = [',', ';', '\t', '|'];
+        let best = ',';
+        let bestScore = 0;
+        for (const cand of candidates) {
+          const counts = firstLines.map(l => l.split(cand).length - 1);
+          if (counts[0] > 0 && counts.every(c => c === counts[0])) {
+            if (counts[0] > bestScore) {
+              bestScore = counts[0];
+              best = cand;
+            }
+          }
+        }
+        return best;
+      }
+
+      function isLikelyCsvText(text, hintMime, hintFileName) {
+        const lowerMime = String(hintMime || '').toLowerCase();
+        const lowerFile = String(hintFileName || '').toLowerCase();
+        if (lowerMime.includes('csv') || lowerFile.endsWith('.csv') || lowerFile.endsWith('.tsv')) {
+          return true;
+        }
+        if (typeof text !== 'string' || text.length < 5) return false;
+        const trimmed = text.trim();
+        if (trimmed.startsWith('<') || trimmed.startsWith('{') || trimmed.startsWith('[')) return false;
+        const lines = trimmed.split(/\r?\n/).filter(l => l.trim().length > 0);
+        if (lines.length >= 2) {
+          const sep = detectCsvDelimiter(trimmed);
+          const colCounts = lines.slice(0, 10).map(l => parseCsvToGrid(l, sep)[0].length);
+          if (colCounts[0] >= 2 && colCounts.every(c => c === colCounts[0])) {
+            return true;
+          }
+        }
+        // Single-line comma-separated header/list with >= 3 items (like "material reference, unit price, leadtime")
+        if (lines.length === 1 && (lines[0].match(/,/g) || []).length >= 2 && lines[0].length < 300) {
+          return true;
+        }
+        return false;
+      }
+
+      // Pure-JS Minimal Valid PDF Generator (creates a valid single-page PDF from text lines and encodes to Base64)
+      function generateSimplePdfBase64(textContent) {
+        const lines = String(textContent || '').replace(/\r\n/g, '\n').split('\n');
+        let streamLines = ['BT', '/F1 11 Tf', '50 750 Td', '15 TL'];
+        for (let i = 0; i < lines.length; i++) {
+          const safe = lines[i]
+            .replace(/\\/g, '\\\\')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)');
+          if (i === 0) streamLines.push('(' + safe + ') Tj');
+          else streamLines.push("T* (" + safe + ") Tj");
+        }
+        streamLines.push('ET');
+        const streamData = streamLines.join('\n');
+
+        const objs = [];
+        objs.push('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+        objs.push('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+        objs.push('3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n');
+        objs.push('4 0 obj\n<< /Length ' + streamData.length + ' >>\nstream\n' + streamData + '\nendstream\nendobj\n');
+        objs.push('5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n');
+
+        let pdf = '%PDF-1.4\n';
+        const offsets = [];
+        for (let i = 0; i < objs.length; i++) {
+          offsets.push(pdf.length);
+          pdf += objs[i];
+        }
+        const xrefPos = pdf.length;
+        pdf += 'xref\n0 ' + (objs.length + 1) + '\n';
+        pdf += '0000000000 65535 f \n';
+        for (let i = 0; i < offsets.length; i++) {
+          pdf += String(offsets[i]).padStart(10, '0') + ' 00000 n \n';
+        }
+        pdf += 'trailer\n<< /Size ' + (objs.length + 1) + ' /Root 1 0 R >>\nstartxref\n' + xrefPos + '\n%%EOF';
+        return utf8ToBase64(pdf);
+      }
+
+      // Helper to generate a sample Base64 Excel (.xlsx) workbook if SheetJS is loaded
+      function createSampleExcelBase64() {
+        if (!window.XLSX) return '';
+        const wb = window.XLSX.utils.book_new();
+        const wsData = [
+          ['Material Number', 'Description', 'Plant', 'Qty', 'Unit Price', 'Currency'],
+          ['21004589', 'VALVE BALL 2 INCH SS316', 'A405-KOTHUR', 12, 145.00, 'USD'],
+          ['21008912', 'PRESSURE GAUGE 0-10 BAR', 'A405-KOTHUR', 6, 68.50, 'USD'],
+          ['21009304', 'GASKET SPIRAL WOUND DN50', 'A405-KOTHUR', 24, 19.25, 'USD']
+        ];
+        const ws = window.XLSX.utils.aoa_to_sheet(wsData);
+        window.XLSX.utils.book_append_sheet(wb, ws, 'Quotation_Items');
+        return window.XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
       }
 
       // =========================================================================
@@ -337,9 +523,66 @@
       // =========================================================================
       const RFQ_BODY_HTML = `<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body><div style="font-family:Calibri,Arial,sans-serif;font-size:13.5px;color:#111827;"><p>This is a request for quotation for the items in the table below. (This is not a purchase order.), please complete the fields in light blue <span style="color:#dc2626;font-weight:600;">within 48 hours.</span></p><table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px;"><thead><tr style="background-color:#2b6cb0;color:#ffffff;font-weight:bold;"><th>Material Number</th><th>Item Description</th><th>Manufacturer</th><th>Manufacturer Part Number</th><th>Vendor #</th><th>Vendor</th><th>Qty</th><th style="background-color:#0284c7;">Unit Price (Edit)</th><th style="background-color:#0284c7;">Lead Time (Edit)</th></tr></thead><tbody><tr><td>21004589</td><td>VALVE BALL 2 INCH SS316</td><td>SWAGELOK</td><td>SS-600-1-4</td><td>15098214</td><td>FLOWTECH IND</td><td>12</td><td style="background-color:#e0f2fe;font-weight:600;">$145.00</td><td style="background-color:#e0f2fe;font-weight:600;">14 Days</td></tr><tr><td>21008912</td><td>PRESSURE GAUGE 0-10 BAR</td><td>WIKA</td><td>232.50.100</td><td>15098214</td><td>FLOWTECH IND</td><td>6</td><td style="background-color:#e0f2fe;font-weight:600;">$68.50</td><td style="background-color:#e0f2fe;font-weight:600;">7 Days</td></tr></tbody></table><p style="margin-top:10px;color:#475569;font-size:12px;">Business Use — Regards, Ranjit Mane</p></div></body></html>`;
 
-      const SCREENSHOT_SAMPLE_JSON = {};
+      const SCREENSHOT_SAMPLE_JSON = {
+        to: "gst.im@pg.com",
+        cc: "",
+        from: "mane.r@pg.com",
+        subject: "Re: [This is a TEST EMAIL - DEV] ACTION NEEDED: PGG Request for Quotation (A405-KOTHUR TS PLANT-PGHP)- 75501352 | 20260930",
+        receivedDateTime: "2026-09-30T18:25:04+00:00",
+        messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVkluAAA=",
+        conversationID: "AAQkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwAQAAg-AU3wC3xJhzexZmddocE=",
+        webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS%2B5DSkLzbBwB5cUXRg29YQ6YBVOCg9%2B0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9%2B0CAABOVkluAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+        body: RFQ_BODY_HTML,
+        extractThreads: [
+          {
+            messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVkluAAA=",
+            webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2Nw",
+            contentType: "html",
+            content: "<html><body><div><div style=\"color:black;font-size:13px;\"><strong>From:</strong> Ranjit Mane &lt;mane.r@pg.com&gt;<br><strong>Subject:</strong> Please confirm quotation pricing and lead time in the table above.</div></div></body></html>"
+          },
+          {
+            messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVklvBBB=",
+            webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2Nw_thread2",
+            contentType: "html",
+            content: "<html><body><div dir=\"ltr\"><div>Initial RFQ generated for KOTHUR TS PLANT (75501352).</div></div></body></html>"
+          }
+        ],
+        body_text: "Business Use\n\n\n\n\nRegards,\nRanjit Mane\n\n\n————————————",
+        attachments: [
+          {
+            fileName: "quotn.csv",
+            contentType: "text/csv",
+            contentBytes: utf8ToBase64("Material Reference,Item Description,Qty,Unit Price,Lead Time\n21004589,VALVE BALL 2 INCH SS316,12,145.00,14 Days\n21008912,PRESSURE GAUGE 0-10 BAR,6,68.50,7 Days")
+          },
+          {
+            fileName: "vendor_quote_sheet.xlsx",
+            contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            contentBytes: createSampleExcelBase64()
+          },
+          {
+            fileName: "rfq_terms.pdf",
+            contentType: "application/pdf",
+            contentBytes: generateSimplePdfBase64("PGG REQUEST FOR QUOTATION - TERMS & CONDITIONS\nDocument ID: RFQ-75501352\nPlant: A405-KOTHUR TS PLANT-PGHP\n\n1. Please submit quotation pricing and lead times within 48 hours.\n2. All prices must include standard packaging and delivery terms.\n3. Edit this text in the Extracted Text tab to update the Base64 PDF!")
+          }
+        ],
+        adlsPath: "2026/09/A405/75501352/received/DS2PR01MB99413292FC29F60834.json"
+      };
 
-      const SAMPLE_PYTHON_DICT = `{}`;
+      const SAMPLE_PYTHON_DICT = `{
+    'to': 'gst.im@pg.com',
+    'cc': None,
+    'from': 'mane.r@pg.com',
+    'is_urgent': True,
+    'subject': 'Re: [TEST EMAIL - PYTHON DICT] PGG Request for Quotation - 75501352',
+    'body': '<html><body><div style="font-family:Calibri,sans-serif;"><p>This is a <strong>Python dict</strong> with single quotes, <code>True</code>, and <code>None</code>. Edit this visual HTML table and watch the Python dict on the left update live!</p><table style="width:100%;border-collapse:collapse;"><tr style="background:#2b6cb0;color:white;"><th>Material Number</th><th>Item Description</th><th>Unit Price</th></tr><tr><td>21004589</td><td>VALVE BALL 2 INCH SS316</td><td style="background:#e0f2fe;">$145.00</td></tr></table></div></body></html>',
+    'attachments': [
+        {
+            'fileName': 'quotn.txt',
+            'contentType': 'text/plain',
+            'contentBytes': 'bWF0ZXJpYWwgcmVmZXJlbmNlLCB1bml0IHByaWNlLCBsZWFkdGltZQ=='
+        }
+    ]
+}`;
 
       // =========================================================================
       // 3. STATE MANAGEMENT
@@ -683,9 +926,17 @@
        * HTML, JSON, SVG, or binary image headers (PNG, JPEG, GIF, WebP),
        * while ignoring opaque binary IDs like Outlook `messageID` (`AAMk...`) or `conversationID` (`AAQk...`).
        */
-      function inspectBase64Value(str, keyName) {
+      function inspectBase64Value(str, keyName, parentObj) {
         if (typeof str !== 'string' || str.length < 8) return { isBase64: false };
         const trimmed = str.trim();
+
+        // Check sibling metadata hints when inside an attachment object (e.g. contentType, mimeType, fileName)
+        let hintMime = '';
+        let hintFileName = '';
+        if (parentObj && typeof parentObj === 'object' && !Array.isArray(parentObj)) {
+          hintMime = String(parentObj.contentType || parentObj.mimeType || parentObj.mime || parentObj.type || '').toLowerCase();
+          hintFileName = String(parentObj.fileName || parentObj.filename || parentObj.name || '').toLowerCase();
+        }
 
         // 1. Explicit data:...;base64,... URI
         const dataMatch = trimmed.match(/^(data:([^;]+);base64,)(.+)$/is);
@@ -693,23 +944,7 @@
           const prefix = dataMatch[1];
           const mime = dataMatch[2].toLowerCase();
           const rawB64 = dataMatch[3].replace(/[\r\n\s]/g, '');
-          if (mime.startsWith('image/')) {
-            return {
-              isBase64: true,
-              prefix: prefix,
-              rawB64: rawB64,
-              kind: 'image',
-              mime: mime,
-              imageDataUrl: prefix + rawB64
-            };
-          }
-          try {
-            const decoded = base64ToUtf8(rawB64);
-            const kind = (mime.includes('html') || isHtmlValue(decoded)) ? 'html' : (isJsonString(decoded) ? 'json' : 'text');
-            return { isBase64: true, prefix: prefix, rawB64: rawB64, kind: kind, mime: mime, decodedText: decoded };
-          } catch (e) {
-            return { isBase64: false };
-          }
+          return classifyCleanedBase64(rawB64, prefix, mime, hintFileName, true);
         }
 
         // Exclude known opaque Exchange/Graph IDs (`messageID`, `conversationID`) unless forced
@@ -717,21 +952,77 @@
         if (lowerKey === 'messageid' || lowerKey === 'conversationid' || trimmed.startsWith('AAMk') || trimmed.startsWith('AAQk')) {
           return { isBase64: false };
         }
-
-        // 2. Raw Base64 string check
-        if (trimmed.length < 12 || /\s/.test(trimmed) || trimmed.length % 4 !== 0) {
-          return { isBase64: false };
-        }
-        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed)) {
-          return { isBase64: false };
-        }
-        // Must have either '=' padding, or Base64 hints in key name (`contentbytes`, `base64`, `b64`, `payload`, `token`, `encoded`), or >= 24 chars
-        const hasKeyHint = /(base64|b64|bytes|encoded|payload|secret|token)/i.test(lowerKey);
-        if (!trimmed.endsWith('=') && !hasKeyHint && trimmed.length < 24) {
+        // Exclude normal URLs, email addresses, ISO dates, or file paths with slashes and spaces
+        if (/^(https?:\/\/|mailto:|urn:)/i.test(trimmed) || trimmed.includes('@') || /^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
           return { isBase64: false };
         }
 
-        // Check known image headers
+        // Strip internal whitespace/newlines in multi-line base64 payloads
+        const cleanB64 = trimmed.replace(/[\r\n\s]/g, '');
+        if (cleanB64.length < 8) return { isBase64: false };
+
+        // Must be valid Base64 or Base64URL characters
+        if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(cleanB64)) {
+          return { isBase64: false };
+        }
+
+        const hasKeyHint = /(base64|b64|bytes|contentbytes|filecontent|encoded|payload|attachment|data)/i.test(lowerKey) ||
+                           Boolean(hintMime) || Boolean(hintFileName);
+
+        if (!hasKeyHint && cleanB64.length % 4 !== 0) {
+          return { isBase64: false };
+        }
+        if (!cleanB64.endsWith('=') && !hasKeyHint && cleanB64.length < 20) {
+          return { isBase64: false };
+        }
+
+        return classifyCleanedBase64(cleanB64, '', hintMime, hintFileName, hasKeyHint);
+      }
+
+      function classifyCleanedBase64(rawB64, prefix, hintMime, hintFileName, hasStrongHint) {
+        const mime = String(hintMime || '').toLowerCase();
+        const fname = String(hintFileName || '').toLowerCase();
+
+        // A. Check PDF signature (`JVBERi0` = `%PDF-`) or PDF mime/filename
+        if (rawB64.startsWith('JVBERi0') || mime.includes('pdf') || fname.endsWith('.pdf')) {
+          try {
+            const bytes = base64ToBytes(rawB64);
+            // Verify %PDF header or explicit mime
+            if (rawB64.startsWith('JVBERi0') || (bytes.length > 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) || mime.includes('pdf')) {
+              return {
+                isBase64: true,
+                prefix: prefix,
+                rawB64: rawB64,
+                kind: 'pdf',
+                mime: 'application/pdf',
+                pdfBytes: bytes
+              };
+            }
+          } catch (e) {}
+        }
+
+        // B. Check Excel (.xlsx PK zip `UEsDB` or .xls OLE2 `0M8R4KGx`) or Excel mime/filename
+        const isExcelHint = mime.includes('spreadsheet') || mime.includes('excel') || mime.includes('ms-excel') ||
+                            fname.endsWith('.xlsx') || fname.endsWith('.xls') || fname.endsWith('.xlsm');
+        if (rawB64.startsWith('UEsDB') || rawB64.startsWith('0M8R4KGx') || isExcelHint) {
+          if (window.XLSX) {
+            try {
+              const wb = window.XLSX.read(rawB64, { type: 'base64' });
+              if (wb && wb.SheetNames && wb.SheetNames.length > 0) {
+                return {
+                  isBase64: true,
+                  prefix: prefix,
+                  rawB64: rawB64,
+                  kind: 'excel',
+                  mime: mime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                  workbook: wb
+                };
+              }
+            } catch (e) {}
+          }
+        }
+
+        // C. Check Image signatures or image/* mime
         const imgSigs = [
           { sig: 'iVBORw0KGgo', mime: 'image/png' },
           { sig: '/9j/', mime: 'image/jpeg' },
@@ -739,47 +1030,96 @@
           { sig: 'UklGR', mime: 'image/webp' }
         ];
         for (let i = 0; i < imgSigs.length; i++) {
-          if (trimmed.startsWith(imgSigs[i].sig)) {
+          if (rawB64.startsWith(imgSigs[i].sig)) {
             return {
               isBase64: true,
-              prefix: '',
-              rawB64: trimmed,
+              prefix: prefix,
+              rawB64: rawB64,
               kind: 'image',
               mime: imgSigs[i].mime,
-              imageDataUrl: 'data:' + imgSigs[i].mime + ';base64,' + trimmed
+              imageDataUrl: 'data:' + imgSigs[i].mime + ';base64,' + rawB64
             };
           }
         }
+        if (mime.startsWith('image/') && !mime.includes('svg')) {
+          return {
+            isBase64: true,
+            prefix: prefix,
+            rawB64: rawB64,
+            kind: 'image',
+            mime: mime,
+            imageDataUrl: 'data:' + mime + ';base64,' + rawB64
+          };
+        }
 
-        // Try UTF-8 decode and verify printable characters
+        // D. Try decoding as text (UTF-8, with Latin-1 fallback if hasStrongHint is true, e.g. CSV with accents/currency symbols)
         try {
-          const decoded = base64ToUtf8(trimmed);
+          const decoded = base64ToUtf8(rawB64, hasStrongHint);
           if (!decoded || decoded.length < 2) return { isBase64: false };
+
+          // Verify mostly printable characters
+          let nonPrintable = 0;
           for (let i = 0; i < decoded.length; i++) {
             const code = decoded.charCodeAt(i);
             if ((code < 32 && code !== 9 && code !== 10 && code !== 13) || code === 65533) {
-              return { isBase64: false };
+              nonPrintable++;
             }
           }
-          if (/^\s*<svg[\s>]/i.test(decoded)) {
+          if (nonPrintable > 0 && (!hasStrongHint || nonPrintable / decoded.length > 0.05)) {
+            return { isBase64: false };
+          }
+
+          if (/^\s*<svg[\s>]/i.test(decoded) || mime.includes('svg')) {
             return {
               isBase64: true,
-              prefix: '',
-              rawB64: trimmed,
+              prefix: prefix,
+              rawB64: rawB64,
               kind: 'image',
               mime: 'image/svg+xml',
               decodedText: decoded,
-              imageDataUrl: 'data:image/svg+xml;base64,' + trimmed
+              imageDataUrl: 'data:image/svg+xml;base64,' + rawB64
             };
           }
-          const kind = isHtmlValue(decoded) ? 'html' : (isJsonString(decoded) ? 'json' : 'text');
-          const mime = kind === 'html' ? 'text/html' : (kind === 'json' ? 'application/json' : 'text/plain');
+
+          if (mime.includes('html') || fname.endsWith('.html') || fname.endsWith('.htm') || isHtmlValue(decoded)) {
+            return {
+              isBase64: true,
+              prefix: prefix,
+              rawB64: rawB64,
+              kind: 'html',
+              mime: 'text/html',
+              decodedText: decoded
+            };
+          }
+
+          if (isLikelyCsvText(decoded, mime, fname)) {
+            return {
+              isBase64: true,
+              prefix: prefix,
+              rawB64: rawB64,
+              kind: 'csv',
+              mime: 'text/csv',
+              decodedText: decoded
+            };
+          }
+
+          if (mime.includes('json') || fname.endsWith('.json') || isJsonString(decoded)) {
+            return {
+              isBase64: true,
+              prefix: prefix,
+              rawB64: rawB64,
+              kind: 'json',
+              mime: 'application/json',
+              decodedText: decoded
+            };
+          }
+
           return {
             isBase64: true,
-            prefix: '',
-            rawB64: trimmed,
-            kind: kind,
-            mime: mime,
+            prefix: prefix,
+            rawB64: rawB64,
+            kind: 'text',
+            mime: mime || 'text/plain',
             decodedText: decoded
           };
         } catch (e) {
@@ -1191,7 +1531,8 @@
       // =========================================================================
       function buildLeafValueSlot(key, val, pathArr, ui) {
         if (typeof val === 'string') {
-          const b64Info = inspectBase64Value(val, key);
+          const parentObj = pathArr.length > 1 ? getValueAtPath(state.data, pathArr.slice(0, -1)) : state.data;
+          const b64Info = inspectBase64Value(val, key, parentObj);
           const isB64 = ui.forceMode === 'base64' || (ui.forceMode !== 'plain' && ui.forceMode !== 'html' && b64Info.isBase64);
           const isHtml = !isB64 && (ui.forceMode === 'html' || (ui.forceMode !== 'plain' && isHtmlValue(val)));
 
@@ -1408,7 +1749,8 @@
 
         const prefix = b64Info.isBase64 ? b64Info.prefix : '';
         const activeTab = ui.b64Tab || 'decoded';
-        const subKind = b64Info.isBase64 ? b64Info.kind.toUpperCase() : 'TEXT';
+        const kind = b64Info.isBase64 ? b64Info.kind : 'text';
+        const subKind = kind.toUpperCase();
 
         // Header Bar
         const header = document.createElement('div');
@@ -1422,7 +1764,7 @@
         b64Badge.textContent = 'BASE64 • ' + subKind;
         leftBadges.appendChild(b64Badge);
 
-        if (!b64Info.isBase64 || b64Info.kind !== 'image') {
+        if (kind !== 'image') {
           const syncHint = document.createElement('span');
           syncHint.className = 'text-[11px] text-emerald-200/75 hidden sm:inline';
           syncHint.textContent = 'Edits auto-encode back to Base64';
@@ -1431,31 +1773,42 @@
 
         header.appendChild(leftBadges);
 
-        // Right Toggle: Decoded | Base64
+        // Right Toggle Buttons depending on kind (CSV / Excel / PDF / HTML / Image / Text)
         const tabGroup = document.createElement('div');
-        tabGroup.className = 'inline-flex items-center rounded bg-[#0b131c] p-0.5 border border-emerald-500/30 text-xs';
+        tabGroup.className = 'inline-flex flex-wrap items-center rounded bg-[#0b131c] p-0.5 border border-emerald-500/30 text-xs gap-0.5';
 
-        const decodedBtn = document.createElement('button');
-        decodedBtn.type = 'button';
-        decodedBtn.className = activeTab === 'decoded'
-          ? 'px-2.5 py-0.5 rounded bg-emerald-500 text-slate-950 font-semibold text-[11.5px] transition'
-          : 'px-2.5 py-0.5 rounded text-slate-300 hover:text-white text-[11.5px] transition';
-        decodedBtn.textContent = b64Info.kind === 'html' ? 'Decoded HTML' : (b64Info.kind === 'image' ? 'Image Preview' : 'Decoded');
-        decodedBtn.addEventListener('click', function () {
-          ui.b64Tab = 'decoded';
-          renderTree();
-        });
+        function addTabBtn(id, label) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = activeTab === id
+            ? 'px-2.5 py-0.5 rounded bg-emerald-500 text-slate-950 font-semibold text-[11.5px] transition'
+            : 'px-2.5 py-0.5 rounded text-slate-300 hover:text-white text-[11.5px] transition';
+          btn.textContent = label;
+          btn.addEventListener('click', function () {
+            ui.b64Tab = id;
+            renderTree();
+          });
+          tabGroup.appendChild(btn);
+        }
 
-        const rawBtn = document.createElement('button');
-        rawBtn.type = 'button';
-        rawBtn.className = activeTab === 'raw'
-          ? 'px-2.5 py-0.5 rounded bg-emerald-500 text-slate-950 font-semibold text-[11.5px] transition'
-          : 'px-2.5 py-0.5 rounded text-slate-300 hover:text-white text-[11.5px] transition';
-        rawBtn.textContent = 'Base64';
-        rawBtn.addEventListener('click', function () {
-          ui.b64Tab = 'raw';
-          renderTree();
-        });
+        if (kind === 'csv') {
+          addTabBtn('decoded', 'Table View');
+          addTabBtn('csv_source', 'CSV Text');
+        } else if (kind === 'excel') {
+          addTabBtn('decoded', 'Spreadsheet');
+          addTabBtn('excel_csv', 'CSV Text');
+        } else if (kind === 'pdf') {
+          addTabBtn('decoded', 'PDF Preview');
+          addTabBtn('pdf_text', 'Edit PDF Text');
+        } else if (kind === 'html') {
+          addTabBtn('decoded', 'Decoded HTML');
+        } else if (kind === 'image') {
+          addTabBtn('decoded', 'Image Preview');
+        } else {
+          addTabBtn('decoded', 'Decoded');
+        }
+
+        addTabBtn('raw', 'Base64');
 
         const plainModeBtn = document.createElement('button');
         plainModeBtn.type = 'button';
@@ -1466,10 +1819,8 @@
           ui.forceMode = 'plain';
           renderTree();
         });
-
-        tabGroup.appendChild(decodedBtn);
-        tabGroup.appendChild(rawBtn);
         tabGroup.appendChild(plainModeBtn);
+
         header.appendChild(tabGroup);
         card.appendChild(header);
 
@@ -1480,11 +1831,18 @@
           syncRightToLeft(false);
         }
 
+        function updateRawBase64Content(newRawB64) {
+          const finalStr = prefix + newRawB64;
+          setValueAtPath(state.data, pathArr, finalStr);
+          syncRightToLeft(false);
+        }
+
+        // TAB: RAW BASE64
         if (activeTab === 'raw') {
           const rawBox = document.createElement('div');
           rawBox.className = 'p-2.5 bg-[#0b0f17] space-y-1';
           const rawTa = document.createElement('textarea');
-          rawTa.rows = 3;
+          rawTa.rows = 4;
           rawTa.spellcheck = false;
           rawTa.value = rawVal;
           rawTa.className = 'w-full bg-[#0b0f17] border border-[#263248] focus:border-emerald-500 rounded p-2 font-mono-code text-xs text-slate-200 focus:outline-none resize-y';
@@ -1497,12 +1855,306 @@
           return card;
         }
 
-        // Decoded View:
-        if (b64Info.isBase64 && b64Info.kind === 'image') {
+        // =====================================================================
+        // CASE A: BASE64 CSV (Editable Table View + CSV Text View)
+        // =====================================================================
+        if (b64Info.isBase64 && kind === 'csv') {
+          const csvText = b64Info.decodedText || '';
+          const sep = detectCsvDelimiter(csvText);
+
+          if (activeTab === 'csv_source') {
+            const bodyWrap = document.createElement('div');
+            bodyWrap.className = 'p-2.5 bg-[#0b111b] space-y-1.5';
+            const ta = document.createElement('textarea');
+            ta.rows = Math.min(14, Math.max(4, csvText.split('\n').length));
+            ta.spellcheck = false;
+            ta.value = csvText;
+            ta.className = 'w-full bg-[#070b12] border border-emerald-500/35 focus:border-emerald-400 rounded px-3 py-2 font-mono-code text-[13px] text-emerald-100 leading-relaxed focus:outline-none resize-y';
+            ta.addEventListener('input', function () {
+              b64Info.decodedText = ta.value;
+              updateDecodedContent(ta.value);
+            });
+            bodyWrap.appendChild(ta);
+            card.appendChild(bodyWrap);
+            return card;
+          }
+
+          // Interactive Editable CSV Table View
+          const grid = parseCsvToGrid(csvText, sep);
+          card.appendChild(buildEditableSpreadsheetGrid(grid, function (updatedGrid) {
+            const newCsv = serializeGridToCsv(updatedGrid, sep);
+            b64Info.decodedText = newCsv;
+            updateDecodedContent(newCsv);
+          }, 'CSV Table (Click any cell to edit — syncs back to Base64)'));
+          return card;
+        }
+
+        // =====================================================================
+        // CASE B: BASE64 EXCEL (.xlsx / .xls via SheetJS)
+        // =====================================================================
+        if (b64Info.isBase64 && kind === 'excel' && b64Info.workbook && window.XLSX) {
+          const wb = b64Info.workbook;
+          const sheetNames = wb.SheetNames || [];
+          const activeSheetName = (ui.activeSheet && sheetNames.includes(ui.activeSheet))
+            ? ui.activeSheet
+            : (sheetNames[0] || 'Sheet1');
+          const ws = wb.Sheets[activeSheetName];
+          const aoa = window.XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+          const grid = aoa.length > 0 ? aoa : [['']];
+          const maxCols = grid.reduce((m, r) => Math.max(m, r.length), 1);
+          grid.forEach(r => { while (r.length < maxCols) r.push(''); });
+
+          // Sheet selector bar if multiple sheets or to download .xlsx
+          const sheetBar = document.createElement('div');
+          sheetBar.className = 'px-3 py-1.5 bg-[#0e1525] border-b border-[#1f293d] flex flex-wrap items-center justify-between gap-2 text-xs';
+
+          const sheetTabs = document.createElement('div');
+          sheetTabs.className = 'flex flex-wrap items-center gap-1';
+          const sheetLbl = document.createElement('span');
+          sheetLbl.className = 'text-slate-400 text-[11px] mr-1';
+          sheetLbl.textContent = 'Sheet:';
+          sheetTabs.appendChild(sheetLbl);
+
+          sheetNames.forEach(function (sName) {
+            const sBtn = document.createElement('button');
+            sBtn.type = 'button';
+            sBtn.className = sName === activeSheetName
+              ? 'px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 font-mono-code text-[11px] font-semibold'
+              : 'px-2 py-0.5 rounded bg-[#162032] text-slate-300 hover:text-white font-mono-code text-[11px]';
+            sBtn.textContent = sName;
+            sBtn.addEventListener('click', function () {
+              ui.activeSheet = sName;
+              renderTree();
+            });
+            sheetTabs.appendChild(sBtn);
+          });
+          sheetBar.appendChild(sheetTabs);
+
+          const dlXlsxBtn = document.createElement('button');
+          dlXlsxBtn.type = 'button';
+          dlXlsxBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-slate-200 text-[11px]';
+          dlXlsxBtn.textContent = '⬇ Download .xlsx';
+          dlXlsxBtn.addEventListener('click', function () {
+            const outB64 = window.XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+            const bytes = base64ToBytes(outB64);
+            const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (key || 'workbook') + '.xlsx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          });
+          sheetBar.appendChild(dlXlsxBtn);
+          card.appendChild(sheetBar);
+
+          if (activeTab === 'excel_csv') {
+            const csvFromSheet = window.XLSX.utils.sheet_to_csv(ws);
+            const bodyWrap = document.createElement('div');
+            bodyWrap.className = 'p-2.5 bg-[#0b111b] space-y-1.5';
+            const ta = document.createElement('textarea');
+            ta.rows = Math.min(14, Math.max(4, csvFromSheet.split('\n').length));
+            ta.spellcheck = false;
+            ta.value = csvFromSheet;
+            ta.className = 'w-full bg-[#070b12] border border-emerald-500/35 focus:border-emerald-400 rounded px-3 py-2 font-mono-code text-[13px] text-emerald-100 leading-relaxed focus:outline-none resize-y';
+            ta.addEventListener('input', function () {
+              const parsedGrid = parseCsvToGrid(ta.value, ',');
+              wb.Sheets[activeSheetName] = window.XLSX.utils.aoa_to_sheet(parsedGrid);
+              const newExcelB64 = window.XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+              updateRawBase64Content(newExcelB64);
+            });
+            bodyWrap.appendChild(ta);
+            card.appendChild(bodyWrap);
+            return card;
+          }
+
+          card.appendChild(buildEditableSpreadsheetGrid(grid, function (updatedGrid) {
+            wb.Sheets[activeSheetName] = window.XLSX.utils.aoa_to_sheet(updatedGrid);
+            const newExcelB64 = window.XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+            updateRawBase64Content(newExcelB64);
+          }, 'Excel Workbook (Edit any cell — re-encodes .xlsx to Base64 live)'));
+          return card;
+        }
+
+        // =====================================================================
+        // CASE C: BASE64 PDF (Rendered via PDF.js onto Canvas + Editable Text)
+        // =====================================================================
+        if (b64Info.isBase64 && kind === 'pdf') {
+          const pdfContainer = document.createElement('div');
+          pdfContainer.className = 'bg-[#0d1320] flex flex-col';
+
+          let zoomPct = ui.pdfZoomPct || 125;
+          const toolbar = document.createElement('div');
+          toolbar.className = 'px-3 py-1.5 bg-[#0e1525] border-b border-[#1f293d] flex flex-wrap items-center justify-between gap-2 text-xs';
+
+          const statusSpan = document.createElement('span');
+          statusSpan.className = 'text-slate-300 font-mono-code text-[11px]';
+          statusSpan.textContent = 'PDF Document';
+          toolbar.appendChild(statusSpan);
+
+          const rightCtrls = document.createElement('div');
+          rightCtrls.className = 'flex items-center gap-1.5';
+
+          const zoomOutBtn = document.createElement('button');
+          zoomOutBtn.type = 'button';
+          zoomOutBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-slate-200 font-mono-code text-xs';
+          zoomOutBtn.textContent = '−';
+
+          const zoomLbl = document.createElement('span');
+          zoomLbl.className = 'font-mono-code text-[11px] text-slate-200 min-w-[42px] text-center';
+          zoomLbl.textContent = zoomPct + '%';
+
+          const zoomInBtn = document.createElement('button');
+          zoomInBtn.type = 'button';
+          zoomInBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-slate-200 font-mono-code text-xs';
+          zoomInBtn.textContent = '+';
+
+          const dlPdfBtn = document.createElement('button');
+          dlPdfBtn.type = 'button';
+          dlPdfBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-slate-200 text-[11px]';
+          dlPdfBtn.textContent = '⬇ Download PDF';
+          dlPdfBtn.addEventListener('click', function () {
+            const bytes = base64ToBytes(b64Info.rawB64);
+            const blob = new Blob([bytes], { type: 'application/pdf' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (key || 'document') + '.pdf';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          });
+
+          rightCtrls.appendChild(zoomOutBtn);
+          rightCtrls.appendChild(zoomLbl);
+          rightCtrls.appendChild(zoomInBtn);
+          rightCtrls.appendChild(dlPdfBtn);
+          toolbar.appendChild(rightCtrls);
+          pdfContainer.appendChild(toolbar);
+
+          const pagesViewport = document.createElement('div');
+          pagesViewport.className = 'p-3 overflow-auto max-h-[720px] resize-y bg-[#0b0f17] flex flex-col items-center gap-3';
+
+          const extractedTextHolder = { text: ui.cachedPdfText || '' };
+
+          function renderPdfPages() {
+            pagesViewport.innerHTML = '<div class="text-xs text-slate-400 py-6 font-mono-code">Rendering PDF pages...</div>';
+            if (!window.pdfjsLib) {
+              pagesViewport.innerHTML = '<div class="text-xs text-amber-300 py-4">PDF.js library loading...</div>';
+              return;
+            }
+            const bytes = base64ToBytes(b64Info.rawB64);
+            const loadingTask = window.pdfjsLib.getDocument({ data: bytes });
+            loadingTask.promise.then(function (pdfDoc) {
+              pagesViewport.innerHTML = '';
+              statusSpan.textContent = 'PDF Document • ' + pdfDoc.numPages + (pdfDoc.numPages === 1 ? ' page' : ' pages');
+              const scale = (zoomPct / 100) * 1.35;
+              const pageTextPromises = [];
+
+              for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+                const pageCanvas = document.createElement('canvas');
+                pageCanvas.className = 'bg-white rounded shadow-lg max-w-full h-auto border border-slate-300';
+                pagesViewport.appendChild(pageCanvas);
+
+                pageTextPromises.push(
+                  pdfDoc.getPage(pageNum).then(function (page) {
+                    const viewport = page.getViewport({ scale: scale });
+                    const ctx = pageCanvas.getContext('2d');
+                    pageCanvas.width = viewport.width;
+                    pageCanvas.height = viewport.height;
+                    page.render({ canvasContext: ctx, viewport: viewport });
+                    return page.getTextContent().then(function (tc) {
+                      return tc.items.map(item => item.str).join(' ');
+                    });
+                  })
+                );
+              }
+
+              Promise.all(pageTextPromises).then(function (pageTexts) {
+                const joined = pageTexts.join('\n\n').trim();
+                if (joined && !ui.cachedPdfText) {
+                  ui.cachedPdfText = joined;
+                  extractedTextHolder.text = joined;
+                }
+              });
+            }).catch(function (err) {
+              pagesViewport.innerHTML = '<div class="p-4 text-xs text-rose-300 font-mono-code">Could not render PDF preview: ' + String(err && err.message ? err.message : err) + '</div>';
+            });
+          }
+
+          if (activeTab === 'pdf_text') {
+            const editWrap = document.createElement('div');
+            editWrap.className = 'p-3 bg-[#0b111b] space-y-2';
+            const note = document.createElement('div');
+            note.className = 'text-[11.5px] text-emerald-300 flex items-center justify-between';
+            note.innerHTML = '<span>Edit PDF text below — automatically generates a new PDF and updates Base64 in JSON/dict:</span>';
+            editWrap.appendChild(note);
+
+            const ta = document.createElement('textarea');
+            ta.rows = 10;
+            ta.spellcheck = false;
+            ta.value = ui.cachedPdfText || 'Loading extracted PDF text...';
+            ta.className = 'w-full bg-[#070b12] border border-emerald-500/35 focus:border-emerald-400 rounded px-3 py-2 font-mono-code text-[13px] text-emerald-100 leading-relaxed focus:outline-none resize-y';
+
+            // If cachedPdfText isn't populated yet, extract it via PDF.js
+            if (!ui.cachedPdfText && window.pdfjsLib) {
+              try {
+                const bytes = base64ToBytes(b64Info.rawB64);
+                window.pdfjsLib.getDocument({ data: bytes }).promise.then(function (pdfDoc) {
+                  const promises = [];
+                  for (let p = 1; p <= pdfDoc.numPages; p++) {
+                    promises.push(pdfDoc.getPage(p).then(pg => pg.getTextContent().then(tc => tc.items.map(i => i.str).join(' '))));
+                  }
+                  Promise.all(promises).then(function (texts) {
+                    ui.cachedPdfText = texts.join('\n\n');
+                    if (document.activeElement !== ta) ta.value = ui.cachedPdfText;
+                  });
+                });
+              } catch (e) {}
+            }
+
+            ta.addEventListener('input', function () {
+              ui.cachedPdfText = ta.value;
+              const newPdfB64 = generateSimplePdfBase64(ta.value);
+              b64Info.rawB64 = newPdfB64;
+              updateRawBase64Content(newPdfB64);
+            });
+
+            editWrap.appendChild(ta);
+            pdfContainer.appendChild(editWrap);
+            card.appendChild(pdfContainer);
+            return card;
+          }
+
+          zoomOutBtn.addEventListener('click', function () {
+            zoomPct = Math.max(50, zoomPct - 25);
+            ui.pdfZoomPct = zoomPct;
+            zoomLbl.textContent = zoomPct + '%';
+            renderPdfPages();
+          });
+          zoomInBtn.addEventListener('click', function () {
+            zoomPct = Math.min(250, zoomPct + 25);
+            ui.pdfZoomPct = zoomPct;
+            zoomLbl.textContent = zoomPct + '%';
+            renderPdfPages();
+          });
+
+          pdfContainer.appendChild(pagesViewport);
+          card.appendChild(pdfContainer);
+          renderPdfPages();
+          return card;
+        }
+
+        // =====================================================================
+        // CASE D: BASE64 IMAGE
+        // =====================================================================
+        if (b64Info.isBase64 && kind === 'image') {
           const imgContainer = document.createElement('div');
           imgContainer.className = 'bg-[#0d1320] flex flex-col';
 
-          // Zoom & dimensions toolbar so detailed scanned documents/forms are 100% readable
           let zoomPct = ui.imgZoomPct || 100;
           const zoomBar = document.createElement('div');
           zoomBar.className = 'px-3 py-1.5 bg-[#0e1525] border-b border-[#1f293d] flex flex-wrap items-center justify-between gap-2 text-xs';
@@ -1541,7 +2193,6 @@
           zoomBar.appendChild(zoomCtrls);
           imgContainer.appendChild(zoomBar);
 
-          // Full-width, large scrollable viewport for the decoded image
           const imgViewport = document.createElement('div');
           imgViewport.className = 'p-3 overflow-auto max-h-[760px] resize-y bg-[#0b0f17] flex justify-center items-start';
 
@@ -1580,8 +2231,13 @@
           imgViewport.appendChild(imgPreviewWrap);
           imgContainer.appendChild(imgViewport);
           card.appendChild(imgContainer);
-        } else if (b64Info.isBase64 && b64Info.kind === 'html') {
-          // Base64 that decoded to HTML: embed our visual HTML editor inside!
+          return card;
+        }
+
+        // =====================================================================
+        // CASE E: BASE64 HTML
+        // =====================================================================
+        if (b64Info.isBase64 && kind === 'html') {
           const innerHtmlCard = buildHtmlValueCard(
             b64Info.decodedText || '',
             pathArr,
@@ -1593,38 +2249,141 @@
           );
           innerHtmlCard.className = 'w-full border-0 bg-transparent';
           card.appendChild(innerHtmlCard);
-        } else {
-          // Decoded Plain Text / CSV / JSON
-          let decodedStr = '';
-          if (b64Info.isBase64 && typeof b64Info.decodedText === 'string') {
-            decodedStr = b64Info.decodedText;
-          } else {
-            try {
-              decodedStr = base64ToUtf8(rawVal);
-            } catch (e) {
-              decodedStr = rawVal;
-            }
-          }
-
-          const bodyWrap = document.createElement('div');
-          bodyWrap.className = 'p-2.5 bg-[#0b111b] space-y-1.5';
-
-          const ta = document.createElement('textarea');
-          const lines = decodedStr.split('\n').length;
-          ta.rows = Math.min(14, Math.max(3, lines));
-          ta.spellcheck = false;
-          ta.value = decodedStr;
-          ta.className = 'w-full bg-[#070b12] border border-emerald-500/35 focus:border-emerald-400 rounded px-3 py-2 font-mono-code text-[13px] text-emerald-100 leading-relaxed focus:outline-none resize-y';
-
-          ta.addEventListener('input', function () {
-            updateDecodedContent(ta.value);
-          });
-
-          bodyWrap.appendChild(ta);
-          card.appendChild(bodyWrap);
+          return card;
         }
 
+        // =====================================================================
+        // CASE F: DECODED PLAIN TEXT OR JSON
+        // =====================================================================
+        let decodedStr = '';
+        if (b64Info.isBase64 && typeof b64Info.decodedText === 'string') {
+          decodedStr = b64Info.decodedText;
+        } else {
+          try {
+            decodedStr = base64ToUtf8(rawVal, true);
+          } catch (e) {
+            decodedStr = rawVal;
+          }
+        }
+
+        const bodyWrap = document.createElement('div');
+        bodyWrap.className = 'p-2.5 bg-[#0b111b] space-y-1.5';
+
+        const ta = document.createElement('textarea');
+        const lines = decodedStr.split('\n').length;
+        ta.rows = Math.min(14, Math.max(3, lines));
+        ta.spellcheck = false;
+        ta.value = decodedStr;
+        ta.className = 'w-full bg-[#070b12] border border-emerald-500/35 focus:border-emerald-400 rounded px-3 py-2 font-mono-code text-[13px] text-emerald-100 leading-relaxed focus:outline-none resize-y';
+
+        ta.addEventListener('input', function () {
+          updateDecodedContent(ta.value);
+        });
+
+        bodyWrap.appendChild(ta);
+        card.appendChild(bodyWrap);
         return card;
+      }
+
+      /**
+       * Shared Interactive Spreadsheet Grid for Base64 CSV and Base64 Excel (.xlsx / .xls)
+       * Every cell is directly editable and syncs back into Base64 in the JSON/dict!
+       */
+      function buildEditableSpreadsheetGrid(grid, onGridChange, subtitleText) {
+        const wrap = document.createElement('div');
+        wrap.className = 'bg-[#0b111b] flex flex-col';
+
+        // Subbar with "+ Row" and "+ Col" buttons
+        const bar = document.createElement('div');
+        bar.className = 'px-3 py-1.5 bg-[#0e1525] border-b border-[#1f293d] flex flex-wrap items-center justify-between gap-2 text-xs';
+
+        const lbl = document.createElement('span');
+        lbl.className = 'text-slate-300 text-[11.5px]';
+        lbl.textContent = subtitleText || 'Editable Table';
+        bar.appendChild(lbl);
+
+        const btnGroup = document.createElement('div');
+        btnGroup.className = 'flex items-center gap-1.5';
+
+        const addRowBtn = document.createElement('button');
+        addRowBtn.type = 'button';
+        addRowBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-emerald-300 font-mono-code text-[11px]';
+        addRowBtn.textContent = '+ Row';
+        addRowBtn.addEventListener('click', function () {
+          const cols = (grid[0] && grid[0].length) || 1;
+          grid.push(new Array(cols).fill(''));
+          onGridChange(grid);
+          renderTableDom();
+        });
+
+        const addColBtn = document.createElement('button');
+        addColBtn.type = 'button';
+        addColBtn.className = 'px-2 py-0.5 rounded bg-[#1a2234] hover:bg-[#232e46] border border-[#2a3650] text-sky-300 font-mono-code text-[11px]';
+        addColBtn.textContent = '+ Col';
+        addColBtn.addEventListener('click', function () {
+          grid.forEach(r => r.push(''));
+          onGridChange(grid);
+          renderTableDom();
+        });
+
+        btnGroup.appendChild(addRowBtn);
+        btnGroup.appendChild(addColBtn);
+        bar.appendChild(btnGroup);
+        wrap.appendChild(bar);
+
+        const tableScroll = document.createElement('div');
+        tableScroll.className = 'p-2.5 overflow-x-auto max-h-[460px] overflow-y-auto resize-y';
+
+        function renderTableDom() {
+          tableScroll.innerHTML = '';
+          const tbl = document.createElement('table');
+          tbl.className = 'w-full border-collapse text-xs font-mono-code bg-[#070b12]';
+
+          for (let r = 0; r < grid.length; r++) {
+            const tr = document.createElement('tr');
+            const isHeader = r === 0 && grid.length > 1;
+            tr.className = isHeader ? 'bg-[#162238] text-sky-200 font-semibold' : 'border-t border-[#1e293b] text-slate-100';
+
+            // Row number index cell
+            const idxTd = document.createElement('td');
+            idxTd.className = 'px-2 py-1 text-[10px] text-slate-500 bg-[#0d1422] border border-[#1e293b] select-none text-center w-8';
+            idxTd.textContent = isHeader ? '#' : String(r);
+            tr.appendChild(idxTd);
+
+            for (let c = 0; c < grid[r].length; c++) {
+              const td = document.createElement('td');
+              td.className = 'border border-[#1e293b] p-0 min-w-[110px]';
+
+              const cellInput = document.createElement('input');
+              cellInput.type = 'text';
+              cellInput.value = String(grid[r][c] == null ? '' : grid[r][c]);
+              cellInput.className = (isHeader
+                ? 'w-full px-2.5 py-1.5 bg-transparent text-sky-200 font-semibold focus:bg-[#0b1528]'
+                : 'w-full px-2.5 py-1.5 bg-transparent text-slate-100 focus:bg-[#0f172a]') +
+                ' text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-emerald-400';
+
+              cellInput.addEventListener('input', (function (rowIdx, colIdx, inp) {
+                return function () {
+                  const raw = inp.value;
+                  // Preserve numeric types in Excel if applicable
+                  const num = Number(raw);
+                  grid[rowIdx][colIdx] = (raw.trim() !== '' && !Number.isNaN(num) && String(num) === raw.trim()) ? num : raw;
+                  onGridChange(grid);
+                };
+              })(r, c, cellInput));
+
+              td.appendChild(cellInput);
+              tr.appendChild(td);
+            }
+            tbl.appendChild(tr);
+          }
+
+          tableScroll.appendChild(tbl);
+        }
+
+        renderTableDom();
+        wrap.appendChild(tableScroll);
+        return wrap;
       }
 
       // =========================================================================
