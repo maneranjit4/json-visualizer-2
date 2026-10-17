@@ -523,66 +523,9 @@
       // =========================================================================
       const RFQ_BODY_HTML = `<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body><div style="font-family:Calibri,Arial,sans-serif;font-size:13.5px;color:#111827;"><p>This is a request for quotation for the items in the table below. (This is not a purchase order.), please complete the fields in light blue <span style="color:#dc2626;font-weight:600;">within 48 hours.</span></p><table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px;"><thead><tr style="background-color:#2b6cb0;color:#ffffff;font-weight:bold;"><th>Material Number</th><th>Item Description</th><th>Manufacturer</th><th>Manufacturer Part Number</th><th>Vendor #</th><th>Vendor</th><th>Qty</th><th style="background-color:#0284c7;">Unit Price (Edit)</th><th style="background-color:#0284c7;">Lead Time (Edit)</th></tr></thead><tbody><tr><td>21004589</td><td>VALVE BALL 2 INCH SS316</td><td>SWAGELOK</td><td>SS-600-1-4</td><td>15098214</td><td>FLOWTECH IND</td><td>12</td><td style="background-color:#e0f2fe;font-weight:600;">$145.00</td><td style="background-color:#e0f2fe;font-weight:600;">14 Days</td></tr><tr><td>21008912</td><td>PRESSURE GAUGE 0-10 BAR</td><td>WIKA</td><td>232.50.100</td><td>15098214</td><td>FLOWTECH IND</td><td>6</td><td style="background-color:#e0f2fe;font-weight:600;">$68.50</td><td style="background-color:#e0f2fe;font-weight:600;">7 Days</td></tr></tbody></table><p style="margin-top:10px;color:#475569;font-size:12px;">Business Use — Regards, Ranjit Mane</p></div></body></html>`;
 
-      const SCREENSHOT_SAMPLE_JSON = {
-        to: "gst.im@pg.com",
-        cc: "",
-        from: "mane.r@pg.com",
-        subject: "Re: [This is a TEST EMAIL - DEV] ACTION NEEDED: PGG Request for Quotation (A405-KOTHUR TS PLANT-PGHP)- 75501352 | 20260930",
-        receivedDateTime: "2026-09-30T18:25:04+00:00",
-        messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVkluAAA=",
-        conversationID: "AAQkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwAQAAg-AU3wC3xJhzexZmddocE=",
-        webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS%2B5DSkLzbBwB5cUXRg29YQ6YBVOCg9%2B0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9%2B0CAABOVkluAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
-        body: RFQ_BODY_HTML,
-        extractThreads: [
-          {
-            messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVkluAAA=",
-            webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2Nw",
-            contentType: "html",
-            content: "<html><body><div><div style=\"color:black;font-size:13px;\"><strong>From:</strong> Ranjit Mane &lt;mane.r@pg.com&gt;<br><strong>Subject:</strong> Please confirm quotation pricing and lead time in the table above.</div></div></body></html>"
-          },
-          {
-            messageID: "AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2NwBGAAAAAACLJy70MNRhiSqnS_5DSkLzbBwB5cUXRg29YQ6YBVOCg9_0CAAADoMfgAAB5cUXRg29YQ6YBVOCg9_0CAABOVklvBBB=",
-            webLink: "https://outlook.office365.com/owa/?ItemID=AAMkADY3OTcyM2Y3LWRmMDQtNDhhYy1hOWM5LTY4N2RlMWQ2MzA2Nw_thread2",
-            contentType: "html",
-            content: "<html><body><div dir=\"ltr\"><div>Initial RFQ generated for KOTHUR TS PLANT (75501352).</div></div></body></html>"
-          }
-        ],
-        body_text: "Business Use\n\n\n\n\nRegards,\nRanjit Mane\n\n\n————————————",
-        attachments: [
-          {
-            fileName: "quotn.csv",
-            contentType: "text/csv",
-            contentBytes: utf8ToBase64("Material Reference,Item Description,Qty,Unit Price,Lead Time\n21004589,VALVE BALL 2 INCH SS316,12,145.00,14 Days\n21008912,PRESSURE GAUGE 0-10 BAR,6,68.50,7 Days")
-          },
-          {
-            fileName: "vendor_quote_sheet.xlsx",
-            contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            contentBytes: createSampleExcelBase64()
-          },
-          {
-            fileName: "rfq_terms.pdf",
-            contentType: "application/pdf",
-            contentBytes: generateSimplePdfBase64("PGG REQUEST FOR QUOTATION - TERMS & CONDITIONS\nDocument ID: RFQ-75501352\nPlant: A405-KOTHUR TS PLANT-PGHP\n\n1. Please submit quotation pricing and lead times within 48 hours.\n2. All prices must include standard packaging and delivery terms.\n3. Edit this text in the Extracted Text tab to update the Base64 PDF!")
-          }
-        ],
-        adlsPath: "2026/09/A405/75501352/received/DS2PR01MB99413292FC29F60834.json"
-      };
+      const SCREENSHOT_SAMPLE_JSON = {};
 
-      const SAMPLE_PYTHON_DICT = `{
-    'to': 'gst.im@pg.com',
-    'cc': None,
-    'from': 'mane.r@pg.com',
-    'is_urgent': True,
-    'subject': 'Re: [TEST EMAIL - PYTHON DICT] PGG Request for Quotation - 75501352',
-    'body': '<html><body><div style="font-family:Calibri,sans-serif;"><p>This is a <strong>Python dict</strong> with single quotes, <code>True</code>, and <code>None</code>. Edit this visual HTML table and watch the Python dict on the left update live!</p><table style="width:100%;border-collapse:collapse;"><tr style="background:#2b6cb0;color:white;"><th>Material Number</th><th>Item Description</th><th>Unit Price</th></tr><tr><td>21004589</td><td>VALVE BALL 2 INCH SS316</td><td style="background:#e0f2fe;">$145.00</td></tr></table></div></body></html>',
-    'attachments': [
-        {
-            'fileName': 'quotn.txt',
-            'contentType': 'text/plain',
-            'contentBytes': 'bWF0ZXJpYWwgcmVmZXJlbmNlLCB1bml0IHByaWNlLCBsZWFkdGltZQ=='
-        }
-    ]
-}`;
+      const SAMPLE_PYTHON_DICT = `{}`;
 
       // =========================================================================
       // 3. STATE MANAGEMENT
